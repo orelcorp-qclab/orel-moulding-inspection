@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Moulding In-Process Inspection System – Orel Corporation QA</title>
+<!--
+=====================================================================
+ SETUP GUIDE (read once)
+ 1. Firebase console > Add project > Build > Authentication > Get started
+    > Sign-in method > enable "Email/Password".
+ 2. Build > Firestore Database > Create database (production mode).
+ 3. Project settings > General > "Your apps" > Web (</>) > copy the config
+    object and paste it into FIREBASE_CONFIG below.
+ 4. Firestore > Rules tab: paste the rules in the comment block further down
+    and Publish.
+ 5. FIRST ADMIN: Authentication > Users > Add user (email+password). Copy its
+    UID. Firestore > Start collection "users" > Document ID = that UID, fields:
+      name (string), email (string), role (string) = admin, active (boolean) = true
+    Later users are created from Admin Settings > Users.
+ 6. GitHub: create repo > Add file > Upload files > index.html > Commit.
+    Settings > Pages > Source: "Deploy from a branch" > main / (root) > Save.
+    Add your github.io domain in Authentication > Settings > Authorized domains.
+ 7. Seed data: sign in as admin > Admin Settings: add machines, items, shifts.
+ Never put service-account keys here. The web config is public by design;
+ security comes from the Firestore rules.
+=====================================================================
+ FIRESTORE SECURITY RULES
+ rules_version = '2';
+ service cloud.firestore {
+  match /databases/{database}/documents {
+   function signedIn(){ return request.auth != null; }
+   function me(){ return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
+   function active(){ return signedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid)) && me().active == true; }
+   function admin(){ return active() && me().role == 'admin'; }
+   match /users/{uid} {
+     allow read: if active() && (request.auth.uid == uid || admin());
+     allow create, update, delete: if admin();
+   }
+   match /items/{id}    { allow read: if active(); allow write: if admin(); }
+   match /machines/{id} { allow read: if active(); allow write: if admin(); }
+   match /settings/{id} { allow read: if active(); allow write: if admin(); }
+   match /inspections/{id} {
+     allow read: if active();
+     allow create: if active()
+       && request.resource.data.submittedBy == request.auth.uid
+       && request.resource.data.checkedByUid == request.auth.uid
+       && request.resource.data.overallResult in ['Pass','Fail']
+       && request.resource.data.sampleSize >= 3
+       && request.resource.data.checklistResults is map
+       && request.resource.data.machineNumber is string
+       && request.resource.data.itemCode is string
+       && request.resource.data.submittedAt == request.time;
+     allow update, delete: if admin();
+   }
+   match /auditLogs/{id} {
+     allow read: if admin();
+     allow create: if active() && request.resource.data.performedBy == request.auth.uid;
+     allow update, delete: if false;
+   }
+  }
+ }
+ (Roles live only in users/{uid}; only admins can write that collection, so
+  nobody can self-promote.)
+=====================================================================
+-->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+:root{--ink:#1b2630;--mut:#5d6b78;--bg:#eef1f4;--card:#fff;--line:#d3dae1;--brand:#0c4a7a;--brand2:#e8a317;
+--pass:#1b8a3f;--passbg:#e3f5e8;--fail:#c62828;--failbg:#fde7e7;--na:#6b7580;--nabg:#e9ecef;--warn:#b26a00}
+*{box-sizing:border-box}html,body{margin:0}
+body{font:16px/1.45 "Segoe UI",system-ui,Roboto,Arial,sans-serif;background:var(--bg);color:var(--ink);padding-bottom:76px}
+h1,h2,h3{margin:0 0 .5rem;line-height:1.2}h2{font-size:1.35rem}h3{font-size:1.05rem}
+header{background:var(--brand);color:#fff;padding:10px 16px;display:flex;align-items:center;gap:12px;border-bottom:4px solid var(--brand2)}
+header .logo{font-weight:800;letter-spacing:.5px;background:var(--brand2);color:#1b2630;padding:4px 10px;border-radius:4px}
+header .t{flex:1;font-weight:600;font-size:.95rem}header small{display:block;font-weight:400;opacity:.85}
+button,.btn{font:inherit;min-height:44px;padding:8px 16px;border-radius:6px;border:1px solid var(--brand);background:var(--brand);color:#fff;cursor:pointer;font-weight:600}
+button.sec{background:#fff;color:var(--brand)}button.danger{background:var(--fail);border-color:var(--fail)}
+button.sm{min-height:34px;padding:4px 10px;font-size:.85rem}button:disabled{opacity:.5;cursor:wait}
+button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:3px solid var(--brand2);outline-offset:1px}
+nav{position:fixed;bottom:0;left:0;right:0;background:#fff;border-top:1px solid var(--line);display:flex;z-index:20}
+nav button{flex:1;background:none;border:0;color:var(--mut);border-radius:0;font-size:.72rem;padding:6px 2px;display:flex;flex-direction:column;align-items:center;min-height:60px}
+nav button b{font-size:1.3rem;line-height:1}nav button.on{color:var(--brand);box-shadow:inset 0 3px 0 var(--brand2)}
+main{max-width:1200px;margin:0 auto;padding:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:14px;margin-bottom:14px}
+.grid{display:grid;gap:12px;grid-template-columns:1fr}
+label{display:block;font-weight:600;font-size:.88rem;margin-bottom:3px}
+input,select,textarea{width:100%;font:inherit;min-height:44px;padding:8px 10px;border:1px solid #9aa7b3;border-radius:6px;background:#fff;color:var(--ink)}
+input[readonly]{background:#f2f4f6}.bad{border-color:var(--fail)!important;background:#fff6f6}
+.kpis{display:grid;gap:10px;grid-template-columns:repeat(2,1fr)}
+.kpi{background:#fff;border:1px solid var(--line);border-left:5px solid var(--brand);border-radius:8px;padding:10px}
+.kpi b{display:block;font-size:1.7rem}.kpi span{color:var(--mut);font-size:.82rem}
+.kpi.p{border-left-color:var(--pass)}.kpi.f{border-left-color:var(--fail)}.kpi.d{border-left-color:var(--brand2)}
+.row{background:#fff;border:1px solid var(--line);border-left:6px solid #c7a600;border-radius:8px;padding:10px;margin-bottom:8px}
+.row.P{border-left-color:var(--pass)}.row.F{border-left-color:var(--fail)}.row.N{border-left-color:var(--na)}
+.row.miss{background:#fff8e1;box-shadow:0 0 0 2px var(--brand2)}
+.row .nm{font-weight:600;margin-bottom:6px}.opts{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.opt{min-height:52px;background:#fff;color:var(--ink);border:2px solid var(--line);font-size:1rem}
+.opt.P.on{background:var(--passbg);border-color:var(--pass);color:var(--pass)}
+.opt.F.on{background:var(--failbg);border-color:var(--fail);color:var(--fail)}
+.opt.N.on{background:var(--nabg);border-color:var(--na);color:var(--na)}
+.opt.on{font-weight:800}.opt.P.on:before{content:"√ "}.opt.F.on:before{content:"✕ "}
+.tag{display:inline-block;padding:2px 10px;border-radius:12px;font-weight:700;font-size:.82rem}
+.tag.Pass,.tag.P{background:var(--passbg);color:var(--pass)}.tag.Fail,.tag.F{background:var(--failbg);color:var(--fail)}.tag.N{background:var(--nabg);color:var(--na)}
+.note{background:#fff4d6;border:1px solid var(--brand2);border-radius:6px;padding:8px 10px;font-size:.9rem;margin:8px 0}
+.warn{color:var(--warn);font-weight:600;font-size:.88rem}
+.tw{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:.88rem}
+th,td{padding:7px 8px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}
+th{background:#f3f5f7;cursor:pointer;position:sticky;top:0}td.wrap{white-space:normal;min-width:140px}
+.bar{display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:10px}.bar>div{flex:1 1 140px}
+.modal{position:fixed;inset:0;background:rgba(20,30,40,.6);z-index:50;display:none;align-items:flex-start;justify-content:center;overflow:auto;padding:14px}
+.modal.show{display:flex}.modal .box{background:#fff;border-radius:8px;max-width:760px;width:100%;padding:16px}
+#login{max-width:380px;margin:12vh auto;padding:0 14px}#toast{position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:99;padding:10px 18px;border-radius:6px;color:#fff;display:none;max-width:92vw}
+.charts{display:grid;gap:12px;grid-template-columns:1fr}.charts .card{margin:0}.hide{display:none!important}
+.sticky{position:sticky;bottom:64px;background:#fff;border:1px solid var(--line);border-radius:8px;padding:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.spin{display:inline-block;width:14px;height:14px;border:2px solid #fff;border-top-color:transparent;border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px}@keyframes sp{to{transform:rotate(360deg)}}
+@media(min-width:700px){.grid{grid-template-columns:repeat(2,1fr)}.kpis{grid-template-columns:repeat(4,1fr)}.charts{grid-template-columns:repeat(2,1fr)}
+ .row{display:grid;grid-template-columns:1fr 330px;align-items:center;gap:10px}.row .nm{margin:0}.opt{min-height:44px}}
+@media(min-width:1000px){body{padding-bottom:0;padding-left:210px}nav{top:0;bottom:auto;right:auto;width:210px;flex-direction:column;border-right:1px solid var(--line);border-top:0;padding-top:70px}
+ nav button{flex:0;flex-direction:row;gap:10px;font-size:.95rem;padding:12px 18px;justify-content:flex-start;min-height:48px}
+ nav button.on{box-shadow:inset 4px 0 0 var(--brand2);background:#f3f5f7}header{margin-left:-210px;padding-left:226px;position:relative;z-index:30}
+ .sticky{bottom:0}.grid.g3{grid-template-columns:repeat(3,1fr)}}
+</style>
+</head>
+<body>
+<div id="toast"></div>
+
+<!-- LOGIN -->
+<div id="login">
+ <div class="card"><h2>Moulding In-Process Inspection System</h2><p style="color:var(--mut);margin-top:0">Orel Corporation QA – sign in with your assigned account.</p>
+ <label>Email</label><input id="lEmail" type="email" autocomplete="username">
+ <label style="margin-top:10px">Password</label><input id="lPass" type="password" autocomplete="current-password">
+ <p id="lErr" class="warn"></p><button id="lBtn" style="width:100%">Sign in</button></div>
+</div>
+
+<!-- APP -->
+<div id="app" class="hide">
+<header><span class="logo">OREL</span><div class="t">Moulding In-Process Inspection System<small>Orel Corporation QA</small></div>
+ <span id="who" style="font-size:.8rem;text-align:right"></span><button class="sec sm" id="outBtn">Sign out</button></header>
+<nav id="nav"></nav>
+<main>
+<!-- DASHBOARD -->
+<section id="v-dash">
+ <h2>Dashboard</h2>
+ <div class="card bar"><div><label>From</label><input type="date" id="dFrom"></div><div><label>To</label><input type="date" id="dTo"></div><div style="flex:0"><button id="dGo">Apply</button></div></div>
+ <div class="kpis" id="kpis"></div>
+ <p class="note" style="margin-top:12px">Inspection failures count <b>records marked Fail</b>. Damage quantity is the <b>number of damaged pieces</b>. They are different measures.</p>
+ <div class="charts" id="dCharts"></div>
+</section>
+<!-- NEW -->
+<section id="v-new" class="hide">
+ <h2>New Inspection</h2>
+ <div class="note">⏱ Minimum 3 shots check is twice per shift. One completed checklist = inspection of the required minimum sample (≥ 3 shots). Extra inspections are always allowed.</div>
+ <div class="card"><h3>Inspection information</h3><div class="grid g3">
+  <div><label>Date</label><input id="fDate" type="date" readonly></div>
+  <div><label>Time</label><input id="fTime" type="time" readonly></div>
+  <div><label>Shift *</label><select id="fShift"></select></div>
+  <div><label>M/C No. *</label><select id="fMc"></select></div>
+  <div><label>Item * (type to search)</label><input id="fItem" list="itemList" placeholder="Code or name" autocomplete="off"><datalist id="itemList"></datalist></div>
+  <div><label>No. of Cavities of Production *</label><input id="fCav" type="number" min="1" inputmode="numeric"></div>
+  <div><label>Sample size (shots) *</label><input id="fSample" type="number" min="3" value="3" inputmode="numeric"></div>
+  <div><label>Checked By</label><input id="fBy" readonly></div>
+  <div><label>Verify By *</label><input id="fVer" list="verList" autocomplete="off"><datalist id="verList"></datalist></div>
+ </div><p id="freq" class="warn"></p></div>
+ <div id="chk"></div>
+ <div class="card"><h3>Material information</h3><div class="grid g3">
+  <div><label>Material *</label><input id="fMat" list="matList"><datalist id="matList"></datalist></div>
+  <div><label>Virgin material (%) *</label><input id="fVir" type="number" min="0" max="100" step="0.1" inputmode="decimal"></div>
+  <div><label>Crushed material (%) *</label><input id="fCru" type="number" min="0" max="100" step="0.1" inputmode="decimal"></div>
+ </div><p id="mixW" class="warn"></p></div>
+ <div class="card"><h3>Overall inspection result</h3><div class="grid">
+  <div><label>Damage qty (pcs) *</label><input id="fDmg" type="number" min="0" value="0" inputmode="numeric"></div>
+  <div><label>Calculated result</label><div id="calc" style="padding:8px 0"></div></div>
+  <div class="adminOnly"><label>Override result (admin only)</label><select id="fOv"><option value="">No override</option><option>Pass</option><option>Fail</option></select></div>
+  <div class="adminOnly"><label>Override explanation (required if overriding)</label><input id="fOvR"></div>
+ </div><label style="margin-top:10px">Remarks</label><textarea id="fRem" rows="3"></textarea></div>
+ <div id="errBox" class="note hide" style="background:#fde7e7;border-color:var(--fail)" role="alert"></div>
+ <div class="sticky"><span id="prog" style="flex:1;font-weight:600"></span><button class="sec" id="clrBtn">Clear</button><button id="subBtn">Submit Inspection</button></div>
+</section>
+<!-- HISTORY -->
+<section id="v-hist" class="hide">
+ <h2>Inspection History</h2>
+ <div class="card"><div class="bar">
+  <div><label>Search item</label><input id="hQ"></div><div><label>From</label><input type="date" id="hFrom"></div><div><label>To</label><input type="date" id="hTo"></div>
+  <div><label>M/C No.</label><select id="hMc"></select></div><div><label>Shift</label><select id="hSh"></select></div>
+  <div><label>Inspector</label><select id="hIn"></select></div><div><label>Result</label><select id="hRes"><option value="">All</option><option>Pass</option><option>Fail</option></select></div>
+ </div><button class="sec" id="hClr">Reset</button> <button id="hExp">Export Excel</button> <span id="hCnt" style="margin-left:8px"></span></div>
+ <div class="card tw"><table><thead id="hHead"></thead><tbody id="hBody"></tbody></table></div>
+ <div style="display:flex;gap:8px;align-items:center;justify-content:center"><button class="sec" id="pPrev">‹ Prev</button><span id="pInfo"></span><button class="sec" id="pNext">Next ›</button></div>
+</section>
+<!-- ANALYSIS -->
+<section id="v-ana" class="hide">
+ <h2>Inspection Analysis &amp; Reports</h2>
+ <div class="card bar"><div><label>From</label><input type="date" id="aFrom"></div><div><label>To</label><input type="date" id="aTo"></div><div style="flex:0"><button id="aGo">Apply</button></div><div style="flex:0"><button id="aExp" class="sec">Export Excel</button></div></div>
+ <div id="anaOut"></div>
+</section>
+<!-- ADMIN -->
+<section id="v-adm" class="hide">
+ <h2>Admin Settings</h2>
+ <div class="card"><h3>Items</h3><div class="grid g3"><div><label>Item Code</label><input id="iCode"></div><div><label>Item Name</label><input id="iName"></div><div><label>Description</label><input id="iDesc"></div></div>
+  <p><button id="iSave">Save item</button> <button class="sec" id="iClr">Clear</button></p><label>Search items</label><input id="iQ"><div class="tw"><table><tbody id="iBody"></tbody></table></div></div>
+ <div class="card"><h3>Machines</h3><div class="bar"><div><label>Machine number</label><input id="mNo"></div><div style="flex:0"><button id="mSave">Save machine</button></div></div><div class="tw"><table><tbody id="mBody"></tbody></table></div></div>
+ <div class="card"><h3>Users</h3><div class="grid g3"><div><label>Name</label><input id="uName"></div><div><label>Email</label><input id="uEmail" type="email"></div><div><label>Temporary password (min 6)</label><input id="uPass" type="text"></div><div><label>Role</label><select id="uRole"><option value="employee">Employee</option><option value="admin">Admin</option></select></div></div>
+  <p><button id="uAdd">Create user</button></p><div class="tw"><table><tbody id="uBody"></tbody></table></div></div>
+ <div class="card"><h3>Checklist settings</h3><label>Shifts (comma separated)</label><input id="sShifts"><label style="margin-top:8px">Materials suggestions (comma separated)</label><input id="sMats">
+  <p><button id="sSave">Save settings</button></p><p class="note">Checklist parameters are fixed in code (version <b id="cv"></b>). Every record stores the version used; changing the list means releasing a new version number, so old records stay unchanged.</p></div>
+</section>
+</main></div>
+
+<div class="modal" id="modal"><div class="box" id="mbox"></div></div>
+
+<script>
+/* ============ 1. FIREBASE CONFIG – PASTE YOURS HERE ============ */
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyAnqfZWExv72MsVysSRIGMq4AfHrT2jl8I",
+  authDomain: "orel-moulding-inspection.firebaseapp.com",
+  projectId: "orel-moulding-inspection",
+  storageBucket: "orel-moulding-inspection.firebasestorage.app",
+  messagingSenderId: "860232622498",
+  appId: "1:860232622498:web:1a8e555a76ae98008392fb"
+};
+/* ================================================================ */
+const CHECKLIST_VERSION = "MLD-v1";
+/* Checklist from the Moulding sheet. key = Excel/DB field, label = original wording */
+const SECTIONS = [
+ {title:"1st off sample & approval", items:[["firstOff","1st off sample availability & Approval"]]},
+ {title:"Colour comparison", items:[["colour","Compare the Color with approved sample"]]},
+ {title:"Visual inspection", note:"Ambient light: 1000 ± 200 lux · Viewing distance: 30 cm · The product should not have any visible defects. PASS = requirement satisfied (defect NOT present). FAIL = defect observed.",
+  items:[["blackDots","Black Dots"],["colourMarks","Colour Marks"],["scratch","Scratch marks"],["flash","Flash"],["sink","Sink mark"],["flow","Flow mark"],["moisture","Moistur mark"],["incomplete","Incomplete"],["excess","Excess parts"]]},
+ {title:"Special controls (If given Instructions)", items:[["funcSample","Check function with given sample"],["dimension","Check given Dimension"],["painting","Check by Painting"]]},
+ {title:"Packing and identification", items:[["packing","Packing (work instruction)"],["labels","Labels Details"]]}
+];
+const ALL = SECTIONS.flatMap(s=>s.items);
+const LBL = Object.fromEntries(ALL);
+const VISUAL = SECTIONS[2].items.map(i=>i[0]), SPECIAL = SECTIONS[3].items.map(i=>i[0]);
+const SYM = {P:"√",F:"✕",N:"N/A"};
+
+if(!firebase.apps.length)firebase.initializeApp(FIREBASE_CONFIG); /* initialise once */
+const auth = firebase.auth(), db = firebase.firestore();
+const $ = id => document.getElementById(id);
+const esc = s => String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const S = {user:null,profile:null,items:[],machines:[],users:[],shifts:["Shift 1","Shift 2","Shift 3"],mats:[],insp:[],res:{},page:1,sort:{k:"ts",d:-1},charts:{},busy:false};
+const isAdmin = () => S.profile && S.profile.role==="admin";
+
+function toast(m,ok=true){const t=$("toast");t.textContent=m;t.style.background=ok?"#1b8a3f":"#c62828";t.style.display="block";clearTimeout(toast.t);toast.t=setTimeout(()=>t.style.display="none",4000)}
+function fsErr(e,ctx){const c=(e&&e.code)||"";let m=(e&&e.message)||String(e);
+ if(c==="permission-denied")m="Permission denied. Your account is not allowed to do this, or the Firestore rules are not published yet.";
+ else if(c==="unavailable"||c==="deadline-exceeded")m="Cannot reach Firebase. Check the internet connection and try again.";
+ else if(c==="unauthenticated")m="Your session has expired. Sign in again.";
+ else if(c==="failed-precondition")m="Firestore setup problem: "+m;
+ return (ctx?ctx+". ":"")+m}
+window.addEventListener("unhandledrejection",e=>{toast(fsErr(e.reason),false)});
+const pad=n=>String(n).padStart(2,"0");
+const today=()=>{const d=new Date();return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`};
+const nowT=()=>{const d=new Date();return pad(d.getHours())+":"+pad(d.getMinutes())};
+const opts=(arr,all)=>(all?`<option value="">${all}</option>`:"")+arr.map(a=>`<option>${esc(a)}</option>`).join("");
+async function audit(action,recordId,details){try{await db.collection("auditLogs").add({action,recordId:recordId||"",performedBy:S.user.uid,performedByName:S.profile.name,timestamp:firebase.firestore.FieldValue.serverTimestamp(),details:details||""})}catch(e){console.warn(e)}}
+
+/* ============ AUTH ============ */
+$("lBtn").onclick=async()=>{$("lErr").textContent="";try{await auth.signInWithEmailAndPassword($("lEmail").value.trim(),$("lPass").value)}catch(e){$("lErr").textContent="Sign-in failed: "+e.message}};
+$("lPass").onkeydown=e=>{if(e.key==="Enter")$("lBtn").click()};
+$("outBtn").onclick=()=>auth.signOut();
+auth.onAuthStateChanged(async u=>{
+ if(!u){S.user=S.profile=null;$("app").classList.add("hide");$("login").classList.remove("hide");return}
+ try{
+  const p=await db.collection("users").doc(u.uid).get();
+  if(!p.exists||p.data().active!==true){await auth.signOut();$("lErr").textContent="No active profile for this account. Contact an admin.";return}
+  S.user=u;S.profile=p.data();
+  $("login").classList.add("hide");$("app").classList.remove("hide");
+  $("who").innerHTML=esc(S.profile.name)+"<br>"+esc(S.profile.role);
+  document.querySelectorAll(".adminOnly").forEach(e=>e.classList.toggle("hide",!isAdmin()));
+  buildNav();await loadMaster();await loadInsp();initForm();show("dash");
+ }catch(e){await auth.signOut();$("lErr").textContent=fsErr(e,"Could not load your profile")}
+});
+
+/* ============ NAV ============ */
+const VIEWS=[["dash","▦","Dashboard"],["new","✚","New Inspection"],["hist","☰","History"],["ana","◔","Analysis"],["adm","⚙","Admin"]];
+function buildNav(){$("nav").innerHTML=VIEWS.filter(v=>v[0]!=="adm"||isAdmin()).map(v=>`<button data-v="${v[0]}"><b>${v[1]}</b>${v[2]}</button>`).join("");
+ $("nav").onclick=e=>{const b=e.target.closest("button");if(b)show(b.dataset.v)}}
+function show(v){VIEWS.forEach(x=>$("v-"+x[0]).classList.toggle("hide",x[0]!==v));
+ document.querySelectorAll("#nav button").forEach(b=>b.classList.toggle("on",b.dataset.v===v));window.scrollTo(0,0);
+ ({dash:renderDash,hist:renderHist,ana:renderAna,adm:renderAdmin,new:()=>{fillLists();updateNew()}})[v]();}
+
+/* ============ DATA LOAD ============ */
+async function loadMaster(){
+ const [i,m,s]=await Promise.all([db.collection("items").get(),db.collection("machines").get(),db.collection("settings").doc("config").get()]);
+ S.items=i.docs.map(d=>({id:d.id,...d.data()})).sort((a,b)=>a.itemCode.localeCompare(b.itemCode));
+ S.machines=m.docs.map(d=>({id:d.id,...d.data()})).sort((a,b)=>a.machineNumber.localeCompare(b.machineNumber,undefined,{numeric:true}));
+ if(s.exists){const c=s.data();if(c.shifts&&c.shifts.length)S.shifts=c.shifts;S.mats=c.materials||[]}
+}
+async function loadInsp(){
+ const q=await db.collection("inspections").orderBy("submittedAt","desc").limit(3000).get();
+ S.insp=q.docs.map(d=>{const x=d.data();return {id:d.id,...x,ts:x.submittedAt?x.submittedAt.toMillis():Date.now()}});
+}
+
+/* ============ NEW INSPECTION FORM ============ */
+function initForm(){
+ $("chk").innerHTML=SECTIONS.map(s=>`<div class="card"><h3>${esc(s.title)}</h3>${s.note?`<div class="note">${esc(s.note)}</div>`:""}`+
+  s.items.map(([k,l])=>`<div class="row" id="r-${k}"><div class="nm">${esc(l)}</div><div class="opts">`+
+   ["P","F","N"].map(o=>`<button type="button" class="opt ${o}" data-k="${k}" data-o="${o}">${o==="P"?"√ PASS":o==="F"?"✕ FAIL":"N/A"}</button>`).join("")+`</div></div>`).join("")+`</div>`).join("");
+ $("chk").onclick=e=>{const b=e.target.closest(".opt");if(!b)return;S.res[b.dataset.k]=b.dataset.o;paint(b.dataset.k);updateNew()};
+ ["fMc","fShift","fItem","fSample"].forEach(i=>$(i).addEventListener("change",updateNew));
+ ["fVir","fCru"].forEach(i=>$(i).addEventListener("input",()=>{const o=i==="fVir"?"fCru":"fVir",v=parseFloat($(i).value);if(!isNaN(v)&&$(o).value==="")$(o).value=Math.round((100-v)*10)/10;updateNew()}));
+ $("fOv").onchange=updateNew;$("clrBtn").onclick=()=>{if(confirm("Clear the form?"))resetForm()};$("subBtn").onclick=startSubmit;
+ $("fBy").value=S.profile.name;resetForm();
+}
+function paint(k){const r=$("r-"+k);r.className="row "+(S.res[k]||"");r.querySelectorAll(".opt").forEach(b=>b.classList.toggle("on",b.dataset.o===S.res[k]))}
+function resetForm(){S.res={};ALL.forEach(([k])=>paint(k));["fMc","fItem","fCav","fVer","fMat","fVir","fCru","fRem","fOvR"].forEach(i=>$(i).value="");$("fOv").value="";$("fSample").value=3;$("fDmg").value=0;$("errBox").classList.add("hide");
+ document.querySelectorAll(".bad,.miss").forEach(e=>e.classList.remove("bad","miss"));updateNew()}
+function fillLists(){
+ $("fShift").innerHTML=opts(S.shifts);$("fMc").innerHTML=`<option value="">Select…</option>`+S.machines.filter(m=>m.active).map(m=>`<option>${esc(m.machineNumber)}</option>`).join("");
+ $("itemList").innerHTML=S.items.filter(i=>i.active).map(i=>`<option value="${esc(i.itemCode+" – "+i.itemName)}">`).join("");
+ $("matList").innerHTML=S.mats.map(m=>`<option value="${esc(m)}">`).join("");
+ $("verList").innerHTML=[...new Set(S.insp.map(i=>i.verifyBy).filter(Boolean))].map(m=>`<option value="${esc(m)}">`).join("");
+}
+function findItem(){const v=$("fItem").value.trim().toLowerCase();return S.items.find(i=>i.active&&(`${i.itemCode} – ${i.itemName}`.toLowerCase()===v||i.itemCode.toLowerCase()===v))}
+/* Single source of truth: any F = Fail; all answered with >=1 P and no F = Pass; otherwise null (pending, or all N/A) */
+function calcResult(res){const v=Object.values(res||S.res);if(v.includes("F"))return "Fail";if(v.length===ALL.length&&v.includes("P"))return "Pass";return null}
+function allNA(){const v=Object.values(S.res);return v.length===ALL.length&&!v.includes("P")&&!v.includes("F")}
+function updateNew(){
+ $("fDate").value=today();$("fTime").value=nowT();
+ const done=Object.keys(S.res).length,r=calcResult();
+ $("prog").textContent=`${done}/${ALL.length} parameters answered`;
+ $("calc").innerHTML=r?`<span class="tag ${r}">${r}</span>`:allNA()?`<span class="warn">All N/A – mark at least one parameter PASS or FAIL</span>`:`<span style="color:var(--mut)">Pending – answer all parameters</span>`;
+ const it=findItem(),mc=$("fMc").value,sh=$("fShift").value;
+ $("freq").textContent=it&&mc?`Inspections today for ${mc} / ${it.itemCode} / ${sh}: ${S.insp.filter(i=>i.date===today()&&i.machineNumber===mc&&i.itemCode===it.itemCode&&i.shift===sh).length} (required: 2 per shift)`:"Reminder: inspection must be performed twice per shift.";
+ const v=parseFloat($("fVir").value),c=parseFloat($("fCru").value);
+ $("mixW").textContent=(v<0||c<0||v>100||c>100)?"⚠ Each percentage must be between 0 and 100.":(!isNaN(v)&&!isNaN(c)&&Math.abs(v+c-100)>0.01)?`⚠ Virgin + Crushed = ${Math.round((v+c)*10)/10}%. It must equal 100% before you can submit.`:"";
+}
+const _upd=updateNew;
+function startSubmit(){
+ if(S.busy)return;
+ document.querySelectorAll(".bad,.miss").forEach(e=>e.classList.remove("bad","miss"));$("errBox").classList.add("hide");
+ const errs=[],mark=id=>$(id).classList.add("bad"),it=findItem();
+ $("fDate").value=today();$("fTime").value=nowT();
+ if(!/^\d{4}-\d{2}-\d{2}$/.test($("fDate").value)){errs.push("The inspection date is missing or invalid. Reload the page.");mark("fDate")}
+ if(!/^\d{2}:\d{2}$/.test($("fTime").value)){errs.push("The inspection time is missing or invalid. Reload the page.");mark("fTime")}
+ if(!S.shifts.includes($("fShift").value)){errs.push("Select a shift.");mark("fShift")}
+ if(!$("fMc").value){errs.push("Select the M/C No.");mark("fMc")}
+ if(!it){errs.push("Select an active item from the list. Text that is not in the list is not accepted.");mark("fItem")}
+ if(!(Number.isInteger(+$("fCav").value)&&+$("fCav").value>=1)){errs.push("Enter the number of cavities (whole number, 1 or more).");mark("fCav")}
+ if(!(Number.isInteger(+$("fSample").value)&&+$("fSample").value>=3)){errs.push("Sample size must be a whole number of at least 3 shots.");mark("fSample")}
+ if(!$("fBy").value.trim()||!S.user){errs.push("Checked By could not be identified. Sign in again.")}
+ if(!$("fVer").value.trim()){errs.push("Enter Verify By.");mark("fVer")}
+ if(!$("fMat").value.trim()){errs.push("Enter the material.");mark("fMat")}
+ const pv=$("fVir").value,pc=$("fCru").value,pvn=parseFloat(pv),pcn=parseFloat(pc);
+ if(pv===""||pc===""||isNaN(pvn)||isNaN(pcn)){errs.push("Enter both Virgin and Crushed material percentages.");mark("fVir");mark("fCru")}
+ else if(pvn<0||pcn<0||pvn>100||pcn>100){errs.push("Material percentages must be between 0 and 100.");mark("fVir");mark("fCru")}
+ else if(Math.abs(pvn+pcn-100)>0.01){errs.push(`Virgin + Crushed must equal 100% (currently ${Math.round((pvn+pcn)*10)/10}%).`);mark("fVir");mark("fCru")}
+ if($("fDmg").value===""||+$("fDmg").value<0||!Number.isInteger(+$("fDmg").value)){errs.push("Damage qty must be a whole number, 0 or more.");mark("fDmg")}
+ const miss=ALL.filter(([k])=>!S.res[k]);miss.forEach(([k])=>$("r-"+k).classList.add("miss"));
+ if(miss.length)errs.push("Answer every checklist parameter. Missing: "+miss.map(a=>a[1]).join(", ")+".");
+ else if(allNA())errs.push("Every parameter is N/A. Mark at least one applicable parameter as PASS or FAIL.");
+ const ov=isAdmin()?$("fOv").value:"";
+ if(ov&&!$("fOvR").value.trim()){errs.push("Enter an explanation for the result override.");mark("fOvR")}
+ if(errs.length){$("errBox").innerHTML="<b>Cannot submit yet:</b><ul style='margin:6px 0 0 18px;padding:0'>"+errs.map(e=>`<li>${esc(e)}</li>`).join("")+"</ul>";
+  $("errBox").classList.remove("hide");toast("Cannot submit: "+errs.length+" problem"+(errs.length>1?"s":"")+" to fix",false);
+  $("errBox").scrollIntoView({block:"center",behavior:"smooth"});return}
+ const calc=calcResult(),final=(ov&&isAdmin())?ov:calc,fails=ALL.filter(([k])=>S.res[k]==="F").map(a=>a[1]);
+ const v=+$("fVir").value,c=+$("fCru").value;
+ $("mbox").innerHTML=`<h3>Confirm inspection</h3><p><b>${esc(it.itemCode)} – ${esc(it.itemName)}</b> · M/C ${esc($("fMc").value)} · ${esc($("fShift").value)}</p>
+  <p>Overall: <span class="tag ${final}">${final}</span>${ov?` (override of calculated ${calc})`:""} · Damage qty: ${+$("fDmg").value}</p>
+  <p>Fail parameters: ${fails.length?esc(fails.join(", ")):"none"}</p>${Math.abs(v+c-100)>0.01?`<p class="warn">⚠ Virgin + Crushed = ${v+c}% (not 100%)</p>`:""}
+  <p>Submitted records cannot be edited by employees.</p><button class="sec" onclick="closeM()">Back</button> <button id="okBtn">Confirm &amp; save</button>`;
+ $("modal").classList.add("show");$("okBtn").onclick=()=>save(it,calc,final,ov);
+}
+function closeM(){$("modal").classList.remove("show")}
+async function save(it,calc,final,ov){
+ if(S.busy)return;S.busy=true;$("okBtn").disabled=true;$("subBtn").disabled=true;$("okBtn").innerHTML='<span class="spin"></span> Saving…';$("subBtn").textContent="Saving…";
+ const d=new Date(),id=`MIP-${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}-${Math.random().toString(36).slice(2,6).toUpperCase()}`;
+ const rec={inspectionId:id,date:today(),time:nowT(),shift:$("fShift").value,machineNumber:$("fMc").value,itemCode:it.itemCode,itemName:it.itemName,
+  cavityCount:+$("fCav").value,sampleSize:+$("fSample").value,checkedBy:S.profile.name,checkedByUid:S.user.uid,verifyBy:$("fVer").value.trim(),
+  checklistResults:{...S.res},checklistVersion:CHECKLIST_VERSION,material:$("fMat").value.trim(),virginPercentage:+$("fVir").value,crushedPercentage:+$("fCru").value,
+  calculatedResult:calc,overallResult:final,overrideReason:(ov&&isAdmin())?$("fOvR").value.trim():"",overrideBy:(ov&&isAdmin())?S.user.uid:"",overrideByName:(ov&&isAdmin())?S.profile.name:"",overrideAt:(ov&&isAdmin())?firebase.firestore.FieldValue.serverTimestamp():null,damageQty:+$("fDmg").value,remarks:$("fRem").value.trim(),
+  submittedAt:firebase.firestore.FieldValue.serverTimestamp(),submittedBy:S.user.uid};
+ let saved=false;
+ try{
+  await db.collection("inspections").doc(id).set(rec); /* fixed ID: a repeat click cannot create a second record */
+  saved=true; /* reached only after Firestore confirmed the write */
+ }catch(e){toast(fsErr(e,"The inspection was NOT saved. Your entries are still in the form"),false);$("okBtn").disabled=false;$("okBtn").textContent="Confirm & save"}
+ if(saved){
+  audit("create",id,rec.overrideReason?"override: "+rec.overrideReason:"");
+  closeM();resetForm();toast("Inspection "+id+" saved");
+  try{await loadInsp()}catch(e){toast(fsErr(e,"Saved, but the history could not be refreshed"),false)}
+  show("hist");
+ }
+ S.busy=false;$("subBtn").disabled=false;$("subBtn").textContent="Submit Inspection";
+}
+
+/* ============ FILTERS / HISTORY ============ */
+function fillFilters(){const keep=(id,h)=>{const v=$(id).value;$(id).innerHTML=h;$(id).value=v};
+ keep("hMc",opts(S.machines.map(m=>m.machineNumber),"All"));keep("hSh",opts(S.shifts,"All"));
+ keep("hIn",opts([...new Set(S.insp.map(i=>i.checkedBy))],"All"))}
+function histFiltered(){const q=$("hQ").value.toLowerCase(),f=$("hFrom").value,t=$("hTo").value,mc=$("hMc").value,sh=$("hSh").value,inn=$("hIn").value,rs=$("hRes").value;
+ return S.insp.filter(i=>(!q||(i.itemCode+" "+i.itemName).toLowerCase().includes(q))&&(!f||i.date>=f)&&(!t||i.date<=t)&&(!mc||i.machineNumber===mc)&&(!sh||i.shift===sh)&&(!inn||i.checkedBy===inn)&&(!rs||i.overallResult===rs))}
+const COLS=[["inspectionId","Inspection ID"],["date","Date"],["time","Time"],["shift","Shift"],["itemName","Item"],["machineNumber","M/C No."],["cavityCount","Cavities"],["checkedBy","Checked By"],["verifyBy","Verify By"],["overallResult","Result"],["damageQty","Damage Qty"],["remarks","Remarks"]];
+function renderHist(){fillFilters();
+ $("hHead").innerHTML="<tr>"+COLS.map(c=>`<th data-k="${c[0]}">${c[1]}${S.sort.k===c[0]?(S.sort.d>0?" ▲":" ▼"):""}</th>`).join("")+"<th>Action</th></tr>";
+ let r=histFiltered();const k=S.sort.k==="date"||S.sort.k==="time"?null:S.sort.k;
+ r.sort((a,b)=>{if(S.sort.k==="date"||S.sort.k==="time")return S.sort.d*((a.date+a.time).localeCompare(b.date+b.time));const x=a[S.sort.k===""?"ts":S.sort.k]??"",y=b[S.sort.k]??"";return S.sort.d*(typeof x==="number"?x-y:String(x).localeCompare(String(y)))});
+ const per=20,pages=Math.max(1,Math.ceil(r.length/per));S.page=Math.min(S.page,pages);
+ $("hBody").innerHTML=r.slice((S.page-1)*per,S.page*per).map(i=>"<tr>"+COLS.map(c=>c[0]==="overallResult"?`<td><span class="tag ${i.overallResult}">${i.overallResult}</span></td>`:`<td class="${c[0]==="remarks"?"wrap":""}">${esc(i[c[0]])}</td>`).join("")+
+  `<td><button class="sm sec" data-v="${i.id}">View</button>${isAdmin()?` <button class="sm sec" data-e="${i.id}">Edit</button> <button class="sm danger" data-d="${i.id}">Delete</button>`:""}</td></tr>`).join("")||`<tr><td colspan="13">No inspections match these filters.</td></tr>`;
+ $("hCnt").textContent=r.length+" records";$("pInfo").textContent=`Page ${S.page} / ${pages}`;$("pPrev").disabled=S.page<=1;$("pNext").disabled=S.page>=pages;
+}
+$("hHead").onclick=e=>{const k=e.target.dataset.k;if(!k)return;S.sort=S.sort.k===k?{k,d:-S.sort.d}:{k,d:1};renderHist()};
+["hQ","hFrom","hTo","hMc","hSh","hIn","hRes"].forEach(i=>$(i).addEventListener("input",()=>{S.page=1;renderHist()}));
+$("hClr").onclick=()=>{["hQ","hFrom","hTo","hMc","hSh","hIn","hRes"].forEach(i=>$(i).value="");S.page=1;renderHist()};
+$("pPrev").onclick=()=>{S.page--;renderHist()};$("pNext").onclick=()=>{S.page++;renderHist()};
+$("hBody").onclick=e=>{const b=e.target.closest("button");if(!b)return;if(b.dataset.v)viewRec(b.dataset.v);if(b.dataset.e)editRec(b.dataset.e);if(b.dataset.d)delRec(b.dataset.d)};
+function viewRec(id){const i=S.insp.find(x=>x.id===id);
+ $("mbox").innerHTML=`<h3>${esc(i.inspectionId)} <span class="tag ${i.overallResult}">${i.overallResult}</span></h3>
+ <p>${esc(i.date)} ${esc(i.time)} · ${esc(i.shift)} · M/C ${esc(i.machineNumber)}<br><b>${esc(i.itemCode)} – ${esc(i.itemName)}</b> · Cavities ${esc(i.cavityCount)} · Sample ${esc(i.sampleSize)} shots<br>Checked by ${esc(i.checkedBy)} · Verified by ${esc(i.verifyBy)} · Checklist ${esc(i.checklistVersion)}</p>`+
+ SECTIONS.map(s=>`<h3>${esc(s.title)}</h3>`+s.items.map(([k,l])=>`<div style="display:flex;justify-content:space-between;border-bottom:1px solid var(--line);padding:5px 0"><span>${esc(l)}</span><span class="tag ${i.checklistResults[k]}">${SYM[i.checklistResults[k]]||"-"}</span></div>`).join("")).join("")+
+ `<p><b>Material:</b> ${esc(i.material)} · Virgin ${esc(i.virginPercentage)}% · Crushed ${esc(i.crushedPercentage)}%<br><b>Damage qty:</b> ${esc(i.damageQty)}<br><b>Remarks:</b> ${esc(i.remarks)||"-"}${i.overrideReason?`<br><b>Override (calc ${esc(i.calculatedResult)}):</b> ${esc(i.overrideReason)}${ovInfo(i)}`:""}</p><button onclick="closeM()">Close</button>`;
+ $("modal").classList.add("show")}
+function ovInfo(i){return i.overrideByName?` – ${esc(i.overrideByName)}${i.overrideAt&&i.overrideAt.toDate?", "+esc(i.overrideAt.toDate().toLocaleString()):""}`:""}
+function editRec(id){const i=S.insp.find(x=>x.id===id);
+ $("mbox").innerHTML=`<h3>Edit ${esc(id)}</h3><p class="note">Checklist answers are not editable (traceability). Changes are written to the audit log.</p>
+ <label>Verify By</label><input id="eV" value="${esc(i.verifyBy)}"><label>Damage qty</label><input id="eD" type="number" min="0" value="${esc(i.damageQty)}">
+ <label>Overall result</label><select id="eR"><option ${i.overallResult==="Pass"?"selected":""}>Pass</option><option ${i.overallResult==="Fail"?"selected":""}>Fail</option></select>
+ <label>Remarks</label><textarea id="eM" rows="3">${esc(i.remarks)}</textarea><label>Reason for change *</label><input id="eW">
+ <p><button class="sec" onclick="closeM()">Cancel</button> <button id="eS">Save changes</button></p>`;$("modal").classList.add("show");
+ $("eS").onclick=async()=>{if(!$("eW").value.trim())return toast("Reason is required",false);
+  if(!$("eV").value.trim())return toast("Verify By is required",false);
+  if($("eD").value===""||+$("eD").value<0)return toast("Damage qty must be 0 or more",false);
+  const sv=firebase.firestore.FieldValue.serverTimestamp(),u={verifyBy:$("eV").value.trim(),damageQty:+$("eD").value,overallResult:$("eR").value,remarks:$("eM").value.trim(),lastEditedBy:S.user.uid,lastEditedAt:sv};
+  if(u.overallResult!==i.overallResult){u.overrideBy=S.user.uid;u.overrideByName=S.profile.name;u.overrideAt=sv;u.overrideReason=$("eW").value.trim()}
+  try{await db.collection("inspections").doc(id).update(u);await audit("edit",id,`reason: ${$("eW").value.trim()} | before: ${i.overallResult}/${i.damageQty}/${i.verifyBy}`);closeM();await loadInsp();renderHist();toast("Record updated")}catch(e){toast(fsErr(e),false)}}}
+async function delRec(id){if(!confirm("Permanently delete "+id+"? This cannot be undone."))return;
+ try{await db.collection("inspections").doc(id).delete();await audit("delete",id,"deleted by admin");await loadInsp();renderHist();toast("Record deleted")}catch(e){toast(fsErr(e),false)}}
+$("modal").onclick=e=>{if(e.target.id==="modal")closeM()};
+
+/* ============ CHART HELPERS & STATS ============ */
+function chart(host,id,title,cfg){let c=$(id);if(!c){const d=document.createElement("div");d.className="card";d.innerHTML=`<h3>${title}</h3><canvas id="${id}" height="220"></canvas>`;host.appendChild(d);c=$(id)}
+ if(S.charts[id])S.charts[id].destroy();cfg.options={responsive:true,maintainAspectRatio:true,...(cfg.options||{})};S.charts[id]=new Chart(c,cfg)}
+const grp=(a,f)=>a.reduce((m,i)=>{const k=f(i);(m[k]=m[k]||{n:0,p:0,f:0,dmg:0});m[k].n++;m[k][i.overallResult==="Pass"?"p":"f"]++;m[k].dmg+=i.damageQty||0;return m},{});
+const inRange=(a,f,t)=>a.filter(i=>(!f||i.date>=f)&&(!t||i.date<=t));
+const PASSC="#1b8a3f",FAILC="#c62828";
+function stack(g){const k=Object.keys(g).sort();return {type:"bar",data:{labels:k,datasets:[{label:"Pass",data:k.map(x=>g[x].p),backgroundColor:PASSC},{label:"Fail",data:k.map(x=>g[x].f),backgroundColor:FAILC}]},options:{scales:{x:{stacked:true},y:{stacked:true,beginAtZero:true,ticks:{precision:0}}}}}}
+function failFreq(a,keys){return keys.map(k=>[LBL[k],a.filter(i=>i.checklistResults&&i.checklistResults[k]==="F").length])}
+function barH(rows,color){return {type:"bar",data:{labels:rows.map(r=>r[0]),datasets:[{label:"Records marked Fail",data:rows.map(r=>r[1]),backgroundColor:color||FAILC}]},options:{indexAxis:"y",scales:{x:{beginAtZero:true,ticks:{precision:0}}},plugins:{legend:{display:false}}}}}
+
+/* ============ DASHBOARD ============ */
+$("dGo").onclick=renderDash;
+function renderDash(){const a=inRange(S.insp,$("dFrom").value,$("dTo").value),p=a.filter(i=>i.overallResult==="Pass").length,f=a.length-p;
+ $("kpis").innerHTML=[["Total inspections",a.length,""],["Pass inspections",p,"p"],["Fail inspections",f,"f"],["Pass rate",a.length?(p/a.length*100).toFixed(1)+"%":"–",""],
+  ["Damage qty (pcs)",a.reduce((s,i)=>s+(i.damageQty||0),0),"d"],["Completed today",S.insp.filter(i=>i.date===today()).length,""]].map(k=>`<div class="kpi ${k[2]}"><b>${k[1]}</b><span>${k[0]}</span></div>`).join("");
+ const h=$("dCharts"),days=grp(a,i=>i.date),dk=Object.keys(days).sort();
+ chart(h,"c1","Daily inspection trend",{type:"line",data:{labels:dk,datasets:[{label:"Total",data:dk.map(k=>days[k].n),borderColor:"#0c4a7a",tension:.2},{label:"Fail",data:dk.map(k=>days[k].f),borderColor:FAILC,tension:.2}]},options:{scales:{y:{beginAtZero:true,ticks:{precision:0}}}}});
+ chart(h,"c2","Pass vs Fail",{type:"doughnut",data:{labels:["Pass","Fail"],datasets:[{data:[p,f],backgroundColor:[PASSC,FAILC]}]}});
+ chart(h,"c3","Machine-wise results",stack(grp(a,i=>"M/C "+i.machineNumber)));
+ chart(h,"c4","Item-wise results",stack(grp(a,i=>i.itemCode)));
+ chart(h,"c5","Failure frequency by parameter (records)",barH(failFreq(a,ALL.map(x=>x[0])).filter(r=>r[1]>0)));
+ chart(h,"c6","Inspections by shift",stack(grp(a,i=>i.shift)));
+}
+
+/* ============ ANALYSIS ============ */
+$("aGo").onclick=renderAna;$("aExp").onclick=()=>exportXlsx(inRange(S.insp,$("aFrom").value,$("aTo").value));
+function tbl(title,g,k1){return `<div class="card tw"><h3>${title}</h3><table><tr><th>${k1}</th><th>Inspections</th><th>Fail</th><th>Pass rate</th><th>Damage qty</th></tr>`+
+ Object.keys(g).sort().map(k=>`<tr><td>${esc(k)}</td><td>${g[k].n}</td><td>${g[k].f}</td><td>${(g[k].p/g[k].n*100).toFixed(1)}%</td><td>${g[k].dmg}</td></tr>`).join("")+`</table></div>`}
+function renderAna(){const a=inRange(S.insp,$("aFrom").value,$("aTo").value);
+ $("anaOut").innerHTML=`<div class="charts" id="aCh"></div><div id="aTb"></div>`;const h=$("aCh");
+ chart(h,"a1","Failing visual parameters (records marked Fail)",barH(failFreq(a,VISUAL)));
+ chart(h,"a2","Failing special control parameters (records)",barH(failFreq(a,SPECIAL),"#b26a00"));
+ const days=grp(a,i=>i.date),dk=Object.keys(days).sort();
+ chart(h,"a3","Damage quantity trend (pcs)",{type:"line",data:{labels:dk,datasets:[{label:"Damage qty",data:dk.map(k=>days[k].dmg),borderColor:"#e8a317",backgroundColor:"#e8a31755",fill:true}]},options:{scales:{y:{beginAtZero:true}}}});
+ chart(h,"a4","Shift-wise performance",stack(grp(a,i=>i.shift)));
+ /* frequency compliance: group by date+machine+item+shift, needs ≥2 */
+ const cg={};a.forEach(i=>{const k=[i.date,i.machineNumber,i.itemCode,i.shift].join("|");cg[k]=(cg[k]||0)+1});
+ const ck=Object.keys(cg),ok=ck.filter(k=>cg[k]>=2).length;
+ $("aTb").innerHTML=tbl("Machine-wise quality",grp(a,i=>"M/C "+i.machineNumber),"Machine")+tbl("Item-wise failure trend",grp(a,i=>i.itemCode+" – "+i.itemName),"Item")+tbl("Shift-wise performance",grp(a,i=>i.shift),"Shift")+
+  `<div class="card tw"><h3>Inspection frequency compliance (2 per shift)</h3><p>${ck.length?`${ok} of ${ck.length} date/machine/item/shift combinations have ≥ 2 inspections (${(ok/ck.length*100).toFixed(0)}%).`:"No data."}</p><table><tr><th>Date</th><th>M/C</th><th>Item</th><th>Shift</th><th>Count</th></tr>`+
+  ck.filter(k=>cg[k]<2).sort().reverse().slice(0,50).map(k=>`<tr>${k.split("|").map(x=>`<td>${esc(x)}</td>`).join("")}<td class="warn">${cg[k]} (below 2)</td></tr>`).join("")+`</table></div>`;
+}
+
+/* ============ EXCEL EXPORT ============ */
+$("hExp").onclick=()=>exportXlsx(histFiltered());
+function exportXlsx(rows){
+ if(!rows.length)return toast("No records to export",false);
+ const head=["Inspection ID","Date","Time","Shift","M/C No.","Item","No. of Cavities of Production","Sample Size",...ALL.map(a=>a[1]),"Material","Virgin Material %","Crushed Material %","Overall Result","Damage Qty","Remarks","Checked By","Verify By","Submission Timestamp"];
+ const data=rows.map(i=>[i.inspectionId,i.date,i.time,i.shift,i.machineNumber,`${i.itemCode} – ${i.itemName}`,i.cavityCount,i.sampleSize,...ALL.map(([k])=>SYM[(i.checklistResults||{})[k]]||""),
+  i.material,i.virginPercentage,i.crushedPercentage,i.overallResult,i.damageQty,i.remarks,i.checkedBy,i.verifyBy,i.submittedAt?i.submittedAt.toDate().toLocaleString():""]);
+ const ws=XLSX.utils.aoa_to_sheet([head,...data]);
+ ws["!cols"]=head.map((h,n)=>({wch:n===0?26:n===5?30:n===head.length-4?30:Math.max(10,Math.min(22,h.length))}));
+ ws["!autofilter"]={ref:XLSX.utils.encode_range({s:{r:0,c:0},e:{r:data.length,c:head.length-1}})};
+ ws["!freeze"]={xSplit:0,ySplit:1};ws["!views"]=[{state:"frozen",ySplit:1}];
+ const n=rows.length,p=rows.filter(i=>i.overallResult==="Pass").length;
+ const sum=[["Summary statistics",""],["Total inspections",n],["Pass inspections",p],["Fail inspections",n-p],["Pass rate %",+(p/n*100).toFixed(1)],["Total damage qty (pcs)",rows.reduce((s,i)=>s+(i.damageQty||0),0)],[],["Parameter","Records marked Fail"],...ALL.map(([k,l])=>[l,rows.filter(i=>(i.checklistResults||{})[k]==="F").length])];
+ const ws2=XLSX.utils.aoa_to_sheet(sum);ws2["!cols"]=[{wch:42},{wch:20}];
+ const wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,ws,"Inspection Data");XLSX.utils.book_append_sheet(wb,ws2,"Summary");
+ XLSX.writeFile(wb,`Moulding_Inprocess_Inspection_${today()}.xlsx`);
+}
+
+/* ============ ADMIN ============ */
+let editItem=null;
+function renderAdmin(){$("cv").textContent=CHECKLIST_VERSION;$("sShifts").value=S.shifts.join(", ");$("sMats").value=S.mats.join(", ");renderItems();renderMachines();renderUsers()}
+function renderItems(){const q=$("iQ").value.toLowerCase();
+ $("iBody").innerHTML=S.items.filter(i=>(i.itemCode+i.itemName).toLowerCase().includes(q)).map(i=>`<tr><td>${esc(i.itemCode)}</td><td>${esc(i.itemName)}</td><td>${esc(i.description)}</td><td><span class="tag ${i.active?"Pass":"N"}">${i.active?"Active":"Inactive"}</span></td>
+  <td><button class="sm sec" data-ie="${i.id}">Edit</button> <button class="sm sec" data-it="${i.id}">${i.active?"Deactivate":"Activate"}</button></td></tr>`).join("")}
+$("iQ").oninput=renderItems;
+$("iClr").onclick=()=>{editItem=null;["iCode","iName","iDesc"].forEach(i=>$(i).value="");$("iCode").readOnly=false};
+$("iSave").onclick=async()=>{const code=$("iCode").value.trim().toUpperCase(),name=$("iName").value.trim();if(!code||!name)return toast("Code and name are required",false);
+ if(/[\/]/.test(code))return toast("Code cannot contain /",false);
+ if(!editItem&&S.items.some(i=>i.itemCode.toUpperCase()===code))return toast("Item code already exists",false);
+ try{if(editItem)await db.collection("items").doc(editItem).update({itemName:name,description:$("iDesc").value.trim()});
+  else await db.collection("items").doc(code).set({itemCode:code,itemName:name,description:$("iDesc").value.trim(),active:true,createdAt:firebase.firestore.FieldValue.serverTimestamp(),createdBy:S.user.uid});
+  await audit(editItem?"item-edit":"item-add",code,name);$("iClr").click();await loadMaster();renderItems();toast("Item saved")}catch(e){toast(fsErr(e),false)}};
+$("iBody").onclick=async e=>{const b=e.target.closest("button");if(!b)return;
+ if(b.dataset.ie){const i=S.items.find(x=>x.id===b.dataset.ie);editItem=i.id;$("iCode").value=i.itemCode;$("iCode").readOnly=true;$("iName").value=i.itemName;$("iDesc").value=i.description||"";window.scrollTo(0,0)}
+ if(b.dataset.it){const i=S.items.find(x=>x.id===b.dataset.it);await db.collection("items").doc(i.id).update({active:!i.active});await audit("item-status",i.id,String(!i.active));await loadMaster();renderItems()}};
+function renderMachines(){$("mBody").innerHTML=S.machines.map(m=>`<tr><td>${esc(m.machineNumber)}</td><td><span class="tag ${m.active?"Pass":"N"}">${m.active?"Active":"Inactive"}</span></td><td><button class="sm sec" data-mt="${m.id}">${m.active?"Deactivate":"Activate"}</button></td></tr>`).join("")}
+$("mSave").onclick=async()=>{const n=$("mNo").value.trim();if(!n||/\//.test(n))return toast("Enter a valid machine number",false);if(S.machines.some(m=>m.machineNumber===n))return toast("Machine already exists",false);
+ try{await db.collection("machines").doc(n).set({machineNumber:n,active:true});await audit("machine-add",n);$("mNo").value="";await loadMaster();renderMachines()}catch(e){toast(fsErr(e),false)}};
+$("mBody").onclick=async e=>{const b=e.target.closest("button");if(!b)return;const m=S.machines.find(x=>x.id===b.dataset.mt);await db.collection("machines").doc(m.id).update({active:!m.active});await audit("machine-status",m.id,String(!m.active));await loadMaster();renderMachines()};
+async function renderUsers(){const q=await db.collection("users").get();S.users=q.docs.map(d=>({id:d.id,...d.data()}));
+ $("uBody").innerHTML=S.users.map(u=>`<tr><td>${esc(u.name)}</td><td>${esc(u.email)}</td><td>${esc(u.role)}</td><td>${u.active?"Active":"Inactive"}</td>
+  <td>${u.id===S.user.uid?"(you)":`<button class="sm sec" data-ur="${u.id}">Make ${u.role==="admin"?"employee":"admin"}</button> <button class="sm sec" data-ua="${u.id}">${u.active?"Deactivate":"Activate"}</button>`}</td></tr>`).join("")}
+$("uBody").onclick=async e=>{const b=e.target.closest("button");if(!b)return;
+ if(b.dataset.ur){const u=S.users.find(x=>x.id===b.dataset.ur),r=u.role==="admin"?"employee":"admin";if(!confirm(`Change ${u.name} to ${r}?`))return;await db.collection("users").doc(u.id).update({role:r});await audit("role-change",u.id,r)}
+ if(b.dataset.ua){const u=S.users.find(x=>x.id===b.dataset.ua);await db.collection("users").doc(u.id).update({active:!u.active});await audit("user-status",u.id,String(!u.active))}
+ renderUsers()};
+$("uAdd").onclick=async()=>{const n=$("uName").value.trim(),em=$("uEmail").value.trim(),pw=$("uPass").value;if(!n||!em||pw.length<6)return toast("Name, email and a 6+ character password are required",false);
+ /* secondary app instance so the admin's own session is not replaced */
+ let sec;try{sec=firebase.apps.find(a=>a.name==="sec")||firebase.initializeApp(FIREBASE_CONFIG,"sec");
+  const c=await sec.auth().createUserWithEmailAndPassword(em,pw);await sec.auth().signOut();
+  await db.collection("users").doc(c.user.uid).set({uid:c.user.uid,name:n,email:em,role:$("uRole").value,active:true});
+  await audit("user-create",c.user.uid,em+" / "+$("uRole").value);["uName","uEmail","uPass"].forEach(i=>$(i).value="");toast("User created");renderUsers()}catch(e){toast(fsErr(e),false)}};
+$("sSave").onclick=async()=>{const sh=$("sShifts").value.split(",").map(s=>s.trim()).filter(Boolean);if(!sh.length)return toast("At least one shift",false);
+ const mt=$("sMats").value.split(",").map(s=>s.trim()).filter(Boolean);
+ try{await db.collection("settings").doc("config").set({shifts:sh,materials:mt,checklistVersion:CHECKLIST_VERSION});await audit("settings",CHECKLIST_VERSION,sh.join(","));await loadMaster();toast("Settings saved")}catch(e){toast(fsErr(e),false)}};
+</script>
+</body>
+</html>
